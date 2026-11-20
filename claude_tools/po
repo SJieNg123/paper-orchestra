@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# PaperOrchestra tools for Claude Code. Usage: po <lit-review|review|doctor|install-skill> [args]
+# Paths given as arguments are resolved against the caller's working directory.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$HERE")"
+
+PY="${PAPER_ORCHESTRA_PYTHON:-}"
+if [ -z "$PY" ]; then
+  if [ -x "$ROOT/.venv/bin/python" ]; then
+    PY="$ROOT/.venv/bin/python"
+  else
+    PY="python3"
+  fi
+fi
+
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" PYTHONUNBUFFERED=1 exec "$PY" -m claude_tools.cli "$@"
