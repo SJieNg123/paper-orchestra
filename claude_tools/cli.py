@@ -14,11 +14,11 @@ from claude_tools._common import REPO_ROOT, emit, gemini_configured, po_command 
 SKILL_SRC = os.path.join(REPO_ROOT, "claude_tools", "skill", "paper-orchestra", "SKILL.md")
 
 
-def _http_status(url, params):
+def _http_status(url, params, headers=None):
     import requests
 
     try:
-        return requests.get(url, params=params, timeout=20).status_code
+        return requests.get(url, params=params, headers=headers or {}, timeout=20).status_code
     except Exception as e:  # noqa: BLE001
         return f"error: {e}"
 
@@ -30,7 +30,9 @@ def doctor(_args) -> int:
         "python_deps": True if not missing else f"missing: {', '.join(missing)}",
         "semantic_scholar_http": _http_status(
             "https://api.semanticscholar.org/graph/v1/paper/search",
-            {"query": "attention is all you need", "limit": 1, "fields": "title"}),
+            {"query": "attention is all you need", "limit": 1, "fields": "title"},
+            # Same header the verifier sends, so this tests the key itself.
+            {"x-api-key": os.environ["SEMANTIC_SCHOLAR_API_KEY"]} if os.getenv("SEMANTIC_SCHOLAR_API_KEY") else None),
         "semantic_scholar_key_env": bool(os.getenv("SEMANTIC_SCHOLAR_API_KEY")),
         "arxiv_http": _http_status("https://export.arxiv.org/api/query",
                                    {"search_query": 'ti:"segment anything"', "max_results": 1}),
