@@ -18,7 +18,8 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
-from claude_tools import bib, s2
+from claude_tools import bib
+from claude_tools import registry as reg
 from claude_tools._common import (
     default_cutoff,
     emit,
@@ -49,6 +50,7 @@ def add_arguments(p) -> None:
     p.add_argument("--cutoff", default=None, help="Only papers published before YYYY-MM (default: current month)")
     p.add_argument("--search-model", default=UPSTREAM_SEARCH_MODEL, help="Gemini model with Google Search grounding")
     p.add_argument("--workers", type=int, default=8, help="Parallel Gemini search calls")
+    p.add_argument("--sources", default="s2,arxiv", help="Verification lookup order: s2, arxiv (default: s2,arxiv)")
     p.add_argument("--dry-run", action="store_true", help="Only parse and print the search tasks")
 
     draft = p.add_argument_group("optional Gemini draft of Introduction + Related Work")
@@ -162,84 +164,10 @@ def discover(agent, tasks, outline, cutoff, workers) -> Tuple[List[Dict], List[D
             for c in cands:
                 title, year, reason = _cand_fields(c)
                 if title:
-                    candidates.append({"title": title, "year": year, "reason": reason, "task": task})
+                    candidates.append({"title": title, "year": year, "reason": reason,
+                                       "section": task["section"], "query": task["focus"],
+                                       "search_type": task["search_type"], "source_url": None})
     return candidates, reports
-
-
-def _record_from_s2(s2p: Dict, cand: Dict) -> Dict:
-    ext = s2p.get("externalIds") or {}
-    journal = s2p.get("journal") or {}
-    abstract = s2p.get("abstract") or ""
-    if len(abstract) > 1500:
-        abstract = abstract[:1500] + "... [Truncated]"
-    return {
-        "citation_key": None,
-        "title": s2p["title"],
-        "authors": [a.get("name", "") for a in s2p.get("authors") or [] if a.get("name")],
-        "venue": s2p.get("venue") or "",
-        "year": s2p.get("year") or cand["year"],
-        "publication_date": s2p.get("publicationDate"),
-        "abstract": abstract,
-        "citation_count": s2p.get("citationCount") or 0,
-        "journal": journal.get("name"),
-        "volume": journal.get("volume"),
-        "pages": (journal.get("pages") or "").strip() or None,
-        "doi": ext.get("DOI"),
-        "arxiv_id": ext.get("ArXiv"),
-        "s2_paper_id": s2p.get("paperId"),
-        "url": s2p.get("url"),
-        "found_in_section": cand["task"]["section"],
-        "found_by_query": cand["task"]["focus"],
-        "search_type": cand["task"]["search_type"],
-        "reason": cand["reason"],
-        "added_at": datetime.datetime.now().isoformat(timespec="seconds"),
-    }
-
-
-def verify(candidates: List[Dict], registry: Dict[str, Dict], cutoff: str) -> List[Dict]:
-    """Phase 1b. Mutates `registry` (normalized title -> record). Returns per-candidate outcomes."""
-    outcomes = []
-    checked: Dict[str, Tuple[str, Optional[str]]] = {}
-    taken_keys = {r["citation_key"] for r in registry.values()}
-
-    for i, cand in enumerate(candidates, 1):
-        norm = bib.normalize_title(cand["title"])
-        out = {"candidate_title": cand["title"], "candidate_year": cand["year"],
-               "section": cand["task"]["section"], "query": cand["task"]["focus"]}
-
-        if norm in checked:
-            status, key = checked[norm]
-            out.update(status="duplicate_candidate", first_status=status, citation_key=key)
-        elif norm in registry:
-            out.update(status="already_in_registry", citation_key=registry[norm]["citation_key"])
-            checked[norm] = ("already_in_registry", out["citation_key"])
-        else:
-            status, s2p = s2.search_title(cand["title"], cand["year"], cutoff)
-            key = None
-            if status == "verified":
-                rec = _record_from_s2(s2p, cand)
-                final_norm = bib.normalize_title(rec["title"])
-                if final_norm in registry:
-                    status, key = "already_in_registry", registry[final_norm]["citation_key"]
-                else:
-                    key = bib.unique_key(bib.base_key(rec["authors"], rec["year"], rec["title"]), taken_keys)
-                    rec["citation_key"] = key
-                    taken_keys.add(key)
-                    registry[final_norm] = rec
-                    out["added"] = True
-                out["matched_title"] = rec["title"]
-            elif status == "after_cutoff" and s2p:
-                out["matched_title"] = s2p.get("title")
-                out["matched_date"] = s2p.get("publicationDate") or s2p.get("year")
-            elif status == "s2_error":
-                out["error"] = (s2p or {}).get("error")
-            checked[norm] = (status, key)
-            out.update(status=status, citation_key=key)
-
-        if i % 10 == 0 or i == len(candidates):
-            log(f"  verified {i}/{len(candidates)} candidates")
-        outcomes.append(out)
-    return outcomes
 
 
 # --------------------------------------------------------------------------- main
@@ -278,10 +206,11 @@ def run(args) -> int:
     if args.write_draft and not args.template:
         return emit({"error": "--write-draft needs --template"}, 1)
 
-    papers_path = os.path.join(out_dir, "papers.json")
-    existing = read_json(papers_path, default=[]) or []
-    registry = {bib.normalize_title(p["title"]): p for p in existing}
-    n_before = len(registry)
+    try:
+        sources = reg.parse_sources(args.sources)
+    except ValueError as e:
+        return emit({"error": str(e)}, 1)
+    registry = reg.Registry(out_dir)
 
     _patch_search_model(lra, args.search_model)
     started = datetime.datetime.now()
@@ -297,19 +226,20 @@ def run(args) -> int:
         )
         log(f"Phase 1a: {len(tasks)} search tasks via {args.search_model} (cutoff {cutoff})")
         candidates, task_reports = discover(agent, tasks, outline, cutoff, args.workers)
-        log(f"Phase 1b: verifying {len(candidates)} candidates on Semantic Scholar")
-        outcomes = verify(candidates, registry, cutoff)
+        log(f"Phase 1b: verifying {len(candidates)} candidates via {'+'.join(sources)}")
+        outcomes = registry.verify(candidates, cutoff, sources)
 
-    papers = sorted(registry.values(), key=lambda p: p["citation_key"])
-    write_json(papers_path, papers)
-    write_text(os.path.join(out_dir, "references.bib"), bib.render_bibtex(papers))
-    write_json(os.path.join(out_dir, "citation_map.json"), bib.citation_map(papers))
-
-    files = {
-        "papers": papers_path,
-        "references_bib": os.path.join(out_dir, "references.bib"),
-        "citation_map": os.path.join(out_dir, "citation_map.json"),
-    }
+    papers = registry.papers
+    files = registry.save({
+        "command": "lit-review",
+        "started_at": started.isoformat(timespec="seconds"),
+        "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "cutoff": cutoff,
+        "search_model": args.search_model,
+        "sources": list(sources),
+        "tasks": task_reports,
+        "candidates": outcomes,
+    })
 
     draft_error = None
     if args.write_draft:
@@ -317,6 +247,7 @@ def run(args) -> int:
         try:
             with stdout_to_stderr():
                 paper_objs = [lra.PaperData(**{**p, "reason": p.get("reason") or "",
+                                               "citation_count": p.get("citation_count") or 0,
                                                "venue": p.get("venue") or "arXiv",
                                                "year": p.get("year") or 0}) for p in papers]
                 if upstream_outline is not None:
@@ -332,36 +263,11 @@ def run(args) -> int:
         except Exception as e:  # noqa: BLE001
             draft_error = f"{type(e).__name__}: {e}"
 
-    status_counts: Dict[str, int] = {}
-    for o in outcomes:
-        status_counts[o["status"]] = status_counts.get(o["status"], 0) + 1
-    added = [o for o in outcomes if o.get("added")]
-
-    run_report = {
-        "started_at": started.isoformat(timespec="seconds"),
-        "finished_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        "cutoff": cutoff,
-        "search_model": args.search_model,
-        "tasks": task_reports,
-        "candidates": outcomes,
-    }
-    run_path = os.path.join(out_dir, "runs", started.strftime("%Y%m%d_%H%M%S") + ".json")
-    write_json(run_path, run_report)
-    files["run_report"] = run_path
-
     failed_tasks = [t for t in task_reports if t["error"] and t["n_candidates"] == 0]
-    result = {
-        "out_dir": out_dir,
-        "cutoff": cutoff,
-        "n_tasks": len(tasks),
-        "n_failed_tasks": len(failed_tasks),
-        "n_candidates": len(candidates),
-        "candidate_status": status_counts,
-        "n_added": len(added),
-        "registry_size": {"before": n_before, "after": len(papers)},
-        "added": [{"key": o["citation_key"], "title": o["matched_title"], "section": o["section"]} for o in added],
-        "files": files,
-    }
+    result = {"out_dir": out_dir, "cutoff": cutoff, "n_tasks": len(tasks),
+              "n_failed_tasks": len(failed_tasks)}
+    result.update(reg.summarize(outcomes, registry))
+    result["files"] = files
     if failed_tasks:
         result["failed_tasks"] = [{"query": t["query"], "error": t["error"]} for t in failed_tasks]
     if draft_error:

@@ -10,7 +10,7 @@ import pytest
 
 os.environ.setdefault("GEMINI_API_KEY", "test-dummy")
 
-from claude_tools import bib, cli, s2  # noqa: E402
+from claude_tools import arxiv, bib, cli, s2  # noqa: E402
 
 
 def run_cli(argv, capsys):
@@ -90,6 +90,7 @@ def mocked(monkeypatch):
 
     monkeypatch.setattr(lra.HybridLiteratureAgent, "_discover_candidates", fake_discover)
     monkeypatch.setattr(s2, "search_title", fake_search)
+    monkeypatch.setattr(arxiv, "search_title", lambda *a, **k: ("not_found", None))
     return calls
 
 
@@ -176,3 +177,136 @@ def test_review_aggregates_scores(tmp_path, capsys, monkeypatch):
 def test_review_missing_paper(capsys):
     code, r = run_cli(["review", "--paper", "/nonexistent.pdf"], capsys)
     assert code == 1 and "not found" in r["error"]
+
+
+# --------------------------------------------------------------------------- verify (no LLM)
+
+ARXIV_PAPER = {
+    "arxiv_id": "2401.12345", "title": "Private Learning with Tiny Budgets", "abstract": "DP.",
+    "authors": ["Ada Lovelace"], "published": "2024-01-20", "year": 2024, "journal_ref": None,
+    "doi": None, "url": "https://arxiv.org/abs/2401.12345",
+}
+
+
+def test_verify_multi_source(tmp_path, capsys, monkeypatch):
+    s2_answers = {
+        "decoupled weight decay regularization": ("verified", FAKE_S2["decoupled weight decay regularization"]),
+        "private learning with tiny budgets": ("s2_error", {"error": "HTTP 429"}),
+        "flaky conference paper": ("s2_error", {"error": "HTTP 429"}),
+        "sam 2: segment anything in images and videos":
+            ("after_cutoff", FAKE_S2["sam 2: segment anything in images and videos"]),
+    }
+    arxiv_answers = {"private learning with tiny budgets": ("verified", ARXIV_PAPER)}
+    monkeypatch.setattr(s2, "search_title", lambda t, *a, **k: s2_answers.get(t.lower(), ("not_found", None)))
+    monkeypatch.setattr(arxiv, "search_title", lambda t, *a, **k: arxiv_answers.get(t.lower(), ("not_found", None)))
+
+    cands = tmp_path / "cands.json"
+    cands.write_text(json.dumps({"candidates": [
+        {"title": "Decoupled Weight Decay Regularization", "year": 2017, "section": "Experiments"},
+        {"title": "Private Learning with Tiny Budgets", "year": 2024, "source_url": "https://arxiv.org/abs/2401.12345"},
+        {"title": "Flaky Conference Paper", "year": 2023},
+        {"title": "SAM 2: Segment Anything in Images and Videos", "year": 2024},
+        {"title": "Invented Paper"},
+        {"no_title": True},
+    ]}))
+    out = str(tmp_path / "lit")
+    code, r = run_cli(["verify", "--candidates", str(cands), "--out-dir", out, "--cutoff", "2024-06"], capsys)
+    assert code == 0
+    assert r["candidate_status"] == {"verified": 2, "lookup_error": 1, "after_cutoff": 1, "not_found": 1}
+    assert {a["via"] for a in r["added"]} == {"s2", "arxiv"}
+    assert r["retry_later"] == ["Flaky Conference Paper"] and r["not_found"] == ["Invented Paper"]
+
+    papers = {p["citation_key"]: p for p in json.load(open(f"{out}/papers.json"))}
+    assert papers["Lovelace2024PrivateLearning"]["verified_via"] == "arxiv"
+    assert papers["Lovelace2024PrivateLearning"]["source_url"].endswith("2401.12345")
+    bibtxt = open(f"{out}/references.bib").read()
+    assert "journal={arXiv preprint arXiv:2401.12345}" in bibtxt
+
+    # arXiv-only mode and --title shortcut
+    code, r = run_cli(["verify", "--title", "Private Learning with Tiny Budgets", "--sources", "arxiv",
+                       "--out-dir", out], capsys)
+    assert r["candidate_status"] == {"already_in_registry": 1}
+
+    code, r = run_cli(["verify", "--title", "x", "--sources", "scholar", "--out-dir", out], capsys)
+    assert code == 1 and "unknown source" in r["error"]
+
+
+def test_arxiv_parse_feed():
+    xml = """<?xml version='1.0' encoding='UTF-8'?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/1610.05820v2</id>
+    <published>2016-10-18T17:52:56Z</published>
+    <title>Membership Inference Attacks against
+      Machine Learning Models</title>
+    <summary> We quantitatively investigate. </summary>
+    <author><name>Reza Shokri</name></author>
+    <author><name>Marco Stronati</name></author>
+    <arxiv:journal_ref>IEEE S&amp;P 2017</arxiv:journal_ref>
+  </entry>
+</feed>"""
+    [p] = arxiv.parse_feed(xml)
+    assert p["arxiv_id"] == "1610.05820" and p["year"] == 2016 and p["published"] == "2016-10-18"
+    assert p["title"] == "Membership Inference Attacks against Machine Learning Models"
+    assert p["authors"] == ["Reza Shokri", "Marco Stronati"] and p["journal_ref"] == "IEEE S&P 2017"
+
+
+# --------------------------------------------------------------------------- review (subagents)
+
+def _review(overall, **extra):
+    r = {"Summary": "s", "Strengths": ["a"], "Weaknesses": ["w"], "Questions": ["q"],
+         "Overall": overall, "Soundness": 3, "Confidence": 4, "Decision": "Reject"}
+    r.update(extra)
+    return r
+
+
+def test_native_review_flow(tmp_path, capsys):
+    paper = tmp_path / "draft.md"
+    paper.write_text("# My privacy paper\nWe propose a method.\n")
+    rdir = tmp_path / "rev"
+
+    code, r = run_cli(["review-prep", "--paper", str(paper), "--out-dir", str(rdir), "--no-benign"], capsys)
+    assert code == 0
+    steps = r["next_steps"]["1_spawn_in_parallel"]
+    assert len(steps) == 3 and all(s["model"] == "opus" for s in steps)
+    assert steps[0]["prompt"].count(str(rdir / "review_1.json")) == 1
+    prompt = (rdir / "reviewer_prompt.md").read_text()
+    assert "mean reviewer" in prompt and str(rdir / "paper.txt") in prompt
+    assert "We propose a method." in (rdir / "paper.txt").read_text()
+
+    # Two reviews written, one malformed -> asks to redo exactly those.
+    (rdir / "review_1.json").write_text(json.dumps(_review(4)))
+    (rdir / "review_2.json").write_text("Sure! ```json\n" + json.dumps(_review(6)) + "\n```")
+    (rdir / "review_3.json").write_text(json.dumps({"Overall": 11}))
+    code, r = run_cli(["review-aggregate", "--dir", str(rdir)], capsys)
+    assert code == 1 and r["status"] == "incomplete_reviews" and r["valid_reviews"] == 2
+    assert [s["description"] for s in r["next_steps"]["1_spawn_in_parallel"]] == [
+        "Redo peer review review_3.json"]
+
+    (rdir / "review_3.json").write_text(json.dumps(_review(8)))
+    code, r = run_cli(["review-aggregate", "--dir", str(rdir)], capsys)
+    assert code == 0 and r["status"] == "needs_meta_review"
+    meta_prompt = (rdir / "meta_prompt.md").read_text()
+    assert "area chair" in meta_prompt and "Review 3/3" in meta_prompt
+
+    (rdir / "meta_review.json").write_text(json.dumps(_review(2, Decision="Accept", Weaknesses=["meta"])))
+    code, r = run_cli(["review-aggregate", "--dir", str(rdir)], capsys)
+    assert code == 0 and r["status"] == "done"
+    assert r["scores"]["Overall"] == 6 and r["overall_spread"]["values"] == [4, 6, 8]
+    assert r["decision"] == "Accept" and r["weaknesses"] == ["meta"]
+    final = json.load(open(r["review_file"]))
+    assert final["reviewer"] == "claude-code-subagents" and final["meta_review_used"] is True
+
+    # A second prep into the same directory is refused.
+    code, r = run_cli(["review-prep", "--paper", str(paper), "--out-dir", str(rdir)], capsys)
+    assert code == 1
+
+
+def test_native_review_single_no_meta(tmp_path, capsys):
+    paper = tmp_path / "draft.txt"
+    paper.write_text("text")
+    rdir = tmp_path / "rev"
+    run_cli(["review-prep", "--paper", str(paper), "--out-dir", str(rdir), "--ensemble", "1"], capsys)
+    (rdir / "review_1.json").write_text(json.dumps(_review(5)))
+    code, r = run_cli(["review-aggregate", "--dir", str(rdir)], capsys)
+    assert code == 0 and r["status"] == "done" and r["scores"]["Overall"] == 5

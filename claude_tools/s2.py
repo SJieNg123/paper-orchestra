@@ -62,7 +62,7 @@ def search_title(
     title: str,
     year_hint: Optional[int] = None,
     cutoff: Optional[str] = None,
-    max_retries: int = 6,
+    max_retries: int = 4,
     timeout: int = 15,
 ) -> Tuple[str, Optional[dict]]:
     """Look up a candidate title on Semantic Scholar.
