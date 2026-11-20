@@ -1,0 +1,6 @@
+# Shell scripts must keep LF line endings, even on Windows checkouts
+# (Git Bash cannot run a script with CRLF line endings).
+*.sh text eol=lf
+claude_tools/po text eol=lf
+# cmd wrappers need CRLF.
+*.cmd text eol=crlf

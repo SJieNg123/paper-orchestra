@@ -23,7 +23,7 @@ import json
 import os
 import re
 
-from claude_tools._common import PO, emit, log, read_json, stdout_to_stderr, write_json, write_text
+from claude_tools._common import emit, po_command, log, read_json, stdout_to_stderr, write_json, write_text
 from claude_tools.review_paper import SCORE_AXES, _score_stats, load_paper_text
 
 DEFAULT_MODEL = "opus"
@@ -94,6 +94,11 @@ def add_aggregate_arguments(p) -> None:
 
 
 # --------------------------------------------------------------------------- helpers
+
+def _q(path: str) -> str:
+    path = path.replace("\\", "/") if os.name == "nt" else path
+    return f'"{path}"' if " " in path else path
+
 
 def _agent_step(model: str, prompt_file: str, output_file: str, what: str) -> dict:
     return {
@@ -224,7 +229,7 @@ def run_prep(args) -> int:
         "files": files,
         "next_steps": {
             "1_spawn_in_parallel": steps,
-            "2_then_run": f"{PO} review-aggregate --dir {out_dir}",
+            "2_then_run": f"{po_command()} review-aggregate --dir {_q(out_dir)}",
         },
     })
 
@@ -283,7 +288,7 @@ def run_aggregate(args) -> int:
                 "1_spawn_in_parallel": [
                     _agent_step(model, manifest["files"]["reviewer_prompt"], p,
                                 f"Redo peer review {os.path.basename(p)}") for p in redo],
-                "2_then_run": f"{PO} review-aggregate --dir {d}",
+                "2_then_run": f"{po_command()} review-aggregate --dir {_q(d)}",
             },
         }, 1)
 
@@ -309,7 +314,7 @@ def run_aggregate(args) -> int:
                 "score_stats": stats,
                 "next_steps": {
                     "1_spawn": [_agent_step(model, meta_prompt, meta_path, "Area-chair meta-review")],
-                    "2_then_run": f"{PO} review-aggregate --dir {d}",
+                    "2_then_run": f"{po_command()} review-aggregate --dir {_q(d)}",
                 },
             })
         try:
@@ -325,7 +330,7 @@ def run_aggregate(args) -> int:
                 "next_steps": {
                     "1_spawn": [_agent_step(model, os.path.join(d, "meta_prompt.md"), meta_path,
                                             "Redo area-chair meta-review")],
-                    "2_then_run": f"{PO} review-aggregate --dir {d}",
+                    "2_then_run": f"{po_command()} review-aggregate --dir {_q(d)}",
                 },
             }, 1)
 

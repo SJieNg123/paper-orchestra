@@ -27,8 +27,26 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 claude_tools/po doctor
 ```
 
-`po` uses `.venv/bin/python` if present, otherwise `python3`, or whatever
-`PAPER_ORCHESTRA_PYTHON` points to.
+`po` uses the repo's `.venv` Python if present, otherwise `python3` / `python`,
+or whatever `PAPER_ORCHESTRA_PYTHON` points to.
+
+### Windows
+
+Claude Code on Windows runs shell commands in Git Bash, which runs `po` as is.
+From PowerShell or cmd, use `claude_tools\po.cmd` instead. Setup in PowerShell:
+
+```powershell
+cd paper-orchestra
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+claude_tools\po.cmd doctor
+claude_tools\po.cmd install-skill --project C:\path\to\your\project
+```
+
+`.gitattributes` keeps `claude_tools/po` on LF line endings. If you cloned before
+that file existed and `po` fails in Git Bash with `$'\r': command not found`,
+re-checkout it: `del claude_tools\po` then `git checkout -- claude_tools/po`.
+Output is always UTF-8, regardless of the console code page.
 
 **Semantic Scholar key (recommended).** Without one, requests share a heavily
 rate-limited pool and verification falls back to arXiv more often. Either:

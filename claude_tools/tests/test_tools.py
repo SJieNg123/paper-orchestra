@@ -310,3 +310,28 @@ def test_native_review_single_no_meta(tmp_path, capsys):
     (rdir / "review_1.json").write_text(json.dumps(_review(5)))
     code, r = run_cli(["review-aggregate", "--dir", str(rdir)], capsys)
     assert code == 0 and r["status"] == "done" and r["scores"]["Overall"] == 5
+
+
+# --------------------------------------------------------------------------- Windows specifics
+
+def test_po_command_windows_path(monkeypatch):
+    from claude_tools import _common
+
+    monkeypatch.setattr(_common, "PO", r"C:\Users\Jie Ng\paper-orchestra\claude_tools\po")
+    monkeypatch.setattr(_common.os, "name", "nt")
+    assert _common.po_command() == '"C:/Users/Jie Ng/paper-orchestra/claude_tools/po"'
+
+
+def test_utf8_output_on_legacy_console(tmp_path):
+    """A cp950 console (Traditional Chinese Windows) must not crash on accented names."""
+    import subprocess
+    import sys
+
+    cli_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cli.py")
+    missing = tmp_path / "Tramèr_Martín.json"
+    env = {**os.environ, "PYTHONIOENCODING": "cp950", "PYTHONUTF8": "0"}
+    env.pop("PYTHONPATH", None)
+    proc = subprocess.run([sys.executable, cli_path, "verify", "--candidates", str(missing),
+                           "--out-dir", str(tmp_path)], capture_output=True, env=env, cwd=str(tmp_path))
+    assert proc.returncode == 1, proc.stderr.decode("utf-8", "replace")
+    assert "Tramèr_Martín" in json.loads(proc.stdout.decode("utf-8"))["error"]

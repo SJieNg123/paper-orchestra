@@ -6,7 +6,10 @@ import os
 import shutil
 import sys
 
-from claude_tools._common import PO, REPO_ROOT, emit, gemini_configured
+if __package__ in (None, ""):  # run as a script: python claude_tools/cli.py
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from claude_tools._common import REPO_ROOT, emit, gemini_configured, po_command  # noqa: E402
 
 SKILL_SRC = os.path.join(REPO_ROOT, "claude_tools", "skill", "paper-orchestra", "SKILL.md")
 
@@ -57,7 +60,7 @@ def install_skill(args) -> int:
         target_root = os.path.join(os.path.abspath(args.project), ".claude", "skills")
     target = os.path.join(target_root, "paper-orchestra", "SKILL.md")
     with open(SKILL_SRC, "r", encoding="utf-8") as f:
-        text = f.read().replace("{{PO}}", PO)
+        text = f.read().replace("{{PO}}", po_command())
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "w", encoding="utf-8") as f:
         f.write(text)
@@ -65,6 +68,12 @@ def install_skill(args) -> int:
 
 
 def main(argv=None) -> int:
+    # Windows consoles default to a legacy code page (e.g. cp950) that cannot
+    # print many author names. Always emit UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     from claude_tools import lit_review, review_native, review_paper, verify
 
     parser = argparse.ArgumentParser(prog="po", description="PaperOrchestra tools for Claude Code")

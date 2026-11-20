@@ -15,6 +15,14 @@ import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PO = os.path.join(REPO_ROOT, "claude_tools", "po")
+
+
+def po_command() -> str:
+    """Path to `po` as Claude Code should type it in its shell (bash, or Git Bash on Windows)."""
+    path = PO.replace("\\", "/") if os.name == "nt" else PO
+    return f'"{path}"' if " " in path else path
+
+
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
